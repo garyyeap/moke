@@ -206,37 +206,60 @@ jobs:
           cp "$APK" artifacts/moke-arm64-unsigned.apk
 
           ls -lh artifacts/
-      - name: Sign APK with debug key
+      
+      - name: Sign Android ARM64 APK
         shell: bash
         run: |
           set -euo pipefail
       
-          APK="moke-arm64-unsigned.apk"
+          APK="$GITHUB_WORKSPACE/artifacts/moke-arm64-unsigned.apk"
+          OUTPUT="$GITHUB_WORKSPACE/artifacts/moke-arm64-signed.apk"
+          KEYSTORE="$RUNNER_TEMP/debug.keystore"
       
-          # Generate debug keystore
+          echo "Checking APK..."
+          ls -lah "$GITHUB_WORKSPACE/artifacts/"
+      
+          if [ ! -f "$APK" ]; then
+            echo "::error::Unsigned ARM64 APK not found: $APK"
+            exit 1
+          fi
+      
+          # Create debug keystore
           keytool -genkeypair \
-            -keystore debug.keystore \
-            -storepass android \
-            -keypass android \
+            -keystore "$KEYSTORE" \
             -alias androiddebugkey \
             -keyalg RSA \
             -keysize 2048 \
             -validity 10000 \
+            -storepass android \
+            -keypass android \
             -dname "CN=Android Debug,O=Android,C=US"
       
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+      
+          # Align APK before signing
+          "$BUILD_TOOLS/zipalign" \
+            -f -p 4 \
+            "$APK" \
+            "$RUNNER_TEMP/moke-arm64-aligned.apk"
+      
           # Sign APK
-          "${ANDROID_HOME}/build-tools/$(ls "${ANDROID_HOME}/build-tools" | sort -V | tail -1)/apksigner" \
-            sign \
-            --ks debug.keystore \
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$KEYSTORE" \
             --ks-key-alias androiddebugkey \
             --ks-pass pass:android \
             --key-pass pass:android \
-            --out moke-arm64-signed.apk \
-            "$APK"
+            --out "$OUTPUT" \
+            "$RUNNER_TEMP/moke-arm64-aligned.apk"
       
           # Verify signature
-          "${ANDROID_HOME}/build-tools/$(ls "${ANDROID_HOME}/build-tools" | sort -V | tail -1)/apksigner" \
-            verify --verbose moke-arm64-signed.apk
+          "$BUILD_TOOLS/apksigner" verify \
+            --verbose \
+            "$OUTPUT"
+      
+          echo "Signed APK:"
+          ls -lh "$OUTPUT"
+
       
       # 13. Analyze APK contents
       - name: Analyze APK size
@@ -292,10 +315,10 @@ jobs:
           PY
 
       # 14. Upload test artifact
-      - name: Upload ARM64 APK
+      - name: Upload signed ARM64 APK
         uses: actions/upload-artifact@v4
         with:
-          name: moke-android-arm64-test
-          path: artifacts/moke-arm64-unsigned.apk
+          name: moke-android-arm64
+          path: artifacts/moke-arm64-signed.apk
           retention-days: 14
           if-no-files-found: error
