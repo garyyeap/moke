@@ -1,0 +1,263 @@
+
+name: Build Android ARM64 APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-arm64:
+    name: Build Android ARM64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+
+    steps:
+      # 1. Checkout source and submodules
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # 2. Node.js and pnpm
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # 3. Java
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      # 4. Android SDK and NDK
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+
+          yes | sdkmanager --install \
+            'platform-tools' \
+            'platforms;android-35' \
+            'build-tools;35.0.0' \
+            'ndk;27.0.12077973' || test "${PIPESTATUS[0]}" -eq 141
+
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      # 5. Rust ARM64 target only
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ./src-tauri -> target
+            ./vendor/tauri -> target
+          key: android-arm64
+
+      # 6. Cache Readest
+      - name: Cache Readest Next.js
+        uses: actions/cache@v4
+        with:
+          path: readest/apps/readest-app/.next/cache
+          key: readest-next-arm64-${{ hashFiles('readest/pnpm-lock.yaml') }}
+          restore-keys: |
+            readest-next-arm64-
+
+      - name: Cache Readest vendor
+        id: cache-readest-vendor
+        uses: actions/cache@v4
+        with:
+          path: readest/apps/readest-app/public/vendor
+          key: readest-vendor-arm64-${{ hashFiles('readest/pnpm-lock.yaml') }}
+          restore-keys: |
+            readest-vendor-arm64-
+
+      # 7. Install dependencies
+      - name: Install Moke dependencies
+        run: pnpm install
+
+      - name: Install Readest dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd readest
+
+          pnpm install --no-frozen-lockfile
+
+          if [ "${{ steps.cache-readest-vendor.outputs.cache-hit }}" != "true" ]; then
+            pnpm --filter @readest/readest-app setup-vendors
+          fi
+
+      # 8. Build custom Tauri CLI
+      - name: Build vendored Tauri CLI
+        shell: bash
+        run: |
+          cargo build --release \
+            --manifest-path "$GITHUB_WORKSPACE/vendor/tauri/Cargo.toml" \
+            -p tauri-cli
+
+          echo "$GITHUB_WORKSPACE/vendor/tauri/target/release" >> "$GITHUB_PATH"
+
+      # 9. Initialize Android project
+      - name: Initialize Android project
+        run: pnpm tauri android init
+
+      - name: Add localized Android names
+        run: node scripts/prepare-mobile-app-names.mjs android
+
+      - name: Generate Android icons
+        run: cargo tauri icon src-tauri/icons/icon.png
+
+      # 10. Preserve Moke's native Android customizations
+      - name: Overlay MainActivity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r -d '' file; do
+            cp src-tauri/android/MainActivity.kt "$file"
+          done < <(
+            find src-tauri/gen/android/app/src/main/java \
+              -name MainActivity.kt -print0
+          )
+
+      - name: Patch Android flavor dimensions
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = "src-tauri/gen/android/app/build.gradle.kts";
+            const s = fs.readFileSync(p, "utf8");
+
+            if (s.includes("missingDimensionStrategy")) {
+              process.exit(0);
+            }
+
+            const updated = s.replace(
+              /(defaultConfig\s*\{\n)/,
+              "$1        missingDimensionStrategy(\"store\", \"foss\")\n"
+            );
+
+            if (updated === s) {
+              throw new Error("defaultConfig block not found");
+            }
+
+            fs.writeFileSync(p, updated);
+          '
+
+      # 11. Build ARM64-only APK
+      - name: Build Android ARM64 APK
+        shell: bash
+        run: |
+          pnpm tauri android build \
+            --apk \
+            --target aarch64 \
+            --split-per-abi
+
+      # 12. Locate unsigned ARM64 output
+      - name: Collect ARM64 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts
+
+          APK=$(find src-tauri/gen/android/app/build/outputs/apk \
+            -type f \
+            -name '*arm64*release*unsigned.apk' \
+            -print -quit)
+
+          if [ -z "$APK" ]; then
+            echo "ARM64 APK not found."
+            find src-tauri/gen/android/app/build/outputs/apk \
+              -type f -name '*.apk'
+            exit 1
+          fi
+
+          cp "$APK" artifacts/moke-arm64-unsigned.apk
+
+          ls -lh artifacts/
+
+      # 13. Analyze APK contents
+      - name: Analyze APK size
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          from collections import defaultdict
+
+          apk = "artifacts/moke-arm64-unsigned.apk"
+
+          with zipfile.ZipFile(apk) as z:
+              files = z.infolist()
+              groups = defaultdict(int)
+              abis = set()
+
+              for f in files:
+                  parts = f.filename.split("/")
+
+                  if parts[0] == "lib" and len(parts) > 2:
+                      groups["lib/" + parts[1]] += f.compress_size
+                      abis.add(parts[1])
+                  else:
+                      groups[parts[0]] += f.compress_size
+
+              print("=== APK SIZE ANALYSIS ===")
+
+              for name, size in sorted(
+                  groups.items(),
+                  key=lambda x: x[1],
+                  reverse=True
+              ):
+                  print(f"{name:30} {size / 1024 / 1024:.2f} MB")
+
+              print("\nABIs found:", sorted(abis))
+
+              if abis != {"arm64-v8a"}:
+                  raise SystemExit(
+                      f"Unexpected ABI libraries: {sorted(abis)}"
+                  )
+
+              print("\n=== TOP 20 LARGEST FILES ===")
+
+              for f in sorted(
+                  files,
+                  key=lambda x: x.compress_size,
+                  reverse=True
+              )[:20]:
+                  print(
+                      f"{f.compress_size / 1024 / 1024:8.2f} MB  "
+                      f"{f.filename}"
+                  )
+          PY
+
+      # 14. Upload test artifact
+      - name: Upload ARM64 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: moke-android-arm64-test
+          path: artifacts/moke-arm64-unsigned.apk
+          retention-days: 14
+          if-no-files-found: error
