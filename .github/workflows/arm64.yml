@@ -42,25 +42,32 @@ jobs:
           cache: gradle
 
       # 4. Android SDK and NDK
+      
       - name: Install Android SDK
         shell: bash
         run: |
           set -euo pipefail
-
+      
           ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-
+      
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
-
-          yes | sdkmanager --install \
-            'platform-tools' \
-            'platforms;android-35' \
-            'build-tools;35.0.0' \
-            'ndk;27.0.12077973' || test "${PIPESTATUS[0]}" -eq 141
-
+      
+          # Accept Android SDK licenses
+          set +o pipefail
+          yes | sdkmanager --licenses > /dev/null
+          set -o pipefail
+      
+          # Install SDK components
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.0.12077973"
+      
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
           echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
 
       # 5. Rust ARM64 target only
       - name: Setup Rust
